@@ -1,0 +1,408 @@
+import cv2
+import numpy as np
+import json
+import time
+import face_recognition
+import sqlite3
+from datetime import datetime, timedelta
+import os
+import openpyxl
+from openpyxl.drawing.image import Image as ExcelImage
+from openpyxl.utils import get_column_letter
+from PIL import Image
+import io
+
+# Load models
+AGE_MODEL = "models/age_net.caffemodel"
+GENDER_MODEL = "models/gender_net.caffemodel"
+AGE_PROTO = "models/deploy_age.prototxt"
+GENDER_PROTO = "models/deploy_gender.prototxt"
+
+age_net = cv2.dnn.readNet(AGE_MODEL, AGE_PROTO)
+gender_net = cv2.dnn.readNet(GENDER_MODEL, GENDER_PROTO)
+
+AGE_GROUPS = ["0-2", "4-6", "8-12", "15-20", "25-32", "38-43", "48-53", "60-100"]
+GENDER_CLASSES = ["Male", "Female"]
+
+scan_interval = 10  # seconds
+last_scan_time = time.time() - scan_interval
+master_face_encoding = None
+
+# Load ad data
+with open("adv.json", "r") as file:
+    ad_data = json.load(file)
+
+# Face detector
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+# Create directory for saving faces
+if not os.path.exists("faces"):
+    os.makedirs("faces")
+
+# Open webcam
+cap = cv2.VideoCapture(0)
+
+known_faces = []
+face_id = 0
+
+def is_new_face(encoding):
+    conn = sqlite3.connect("advertisement.db")
+    c = conn.cursor()
+    one_hour_ago = datetime.now() - timedelta(hours=1)
+    c.execute("SELECT encoding FROM unique_faces WHERE timestamp >= ?", (one_hour_ago.strftime("%Y-%m-%d %H:%M:%S"),))
+    rows = c.fetchall()
+    conn.close()
+
+    for row in rows:
+        stored_encoding = np.frombuffer(row[0], dtype=np.float64)
+        matches = face_recognition.compare_faces([stored_encoding], encoding, tolerance=0.6)
+        if True in matches:
+            return False
+    return True
+
+def save_unique_face(encoding):
+    conn = sqlite3.connect("advertisement.db")
+    c = conn.cursor()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("INSERT INTO unique_faces (encoding, timestamp) VALUES (?, ?)", (encoding.tobytes(), now))
+    conn.commit()
+    conn.close()
+
+def save_face_image(face_image, face_id):
+    face_filename = f"faces/face_{face_id}.jpg"
+    cv2.imwrite(face_filename, face_image)
+
+def delete_old_faces():
+    conn = sqlite3.connect("advertisement.db")
+    c = conn.cursor()
+    one_hour_ago = datetime.now() - timedelta(hours=1)
+    c.execute("DELETE FROM unique_faces WHERE timestamp < ?", (one_hour_ago.strftime("%Y-%m-%d %H:%M:%S"),))
+    conn.commit()
+    conn.close()
+
+def save_to_excel(gender, age, ad_image_path, face_image, excel_path="visitor_data.xlsx"):
+    try:
+        try:
+            wb = openpyxl.load_workbook(excel_path)
+            ws = wb.active
+        except FileNotFoundError:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.append(["Timestamp", "Gender", "Age", "Ad Image", "Face Image"])
+            ws.column_dimensions[get_column_letter(1)].width = 20
+            ws.column_dimensions[get_column_letter(2)].width = 10
+            ws.column_dimensions[get_column_letter(3)].width = 10
+            ws.column_dimensions[get_column_letter(4)].width = 30
+            ws.column_dimensions[get_column_letter(5)].width = 15
+
+        face_pil = Image.fromarray(cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB))
+        img_byte_arr = io.BytesIO()
+        face_pil.save(img_byte_arr, format='PNG')
+        img_byte_arr.seek(0)
+
+        temp_img_path = "temp_face.png"
+        with open(temp_img_path, 'wb') as f:
+            f.write(img_byte_arr.read())
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ws.append([timestamp, gender, age, ad_image_path, ""])
+
+        img = ExcelImage(temp_img_path)
+        img.width, img.height = 80, 80
+        img_cell = f"E{ws.max_row}"
+        ws.add_image(img, img_cell)
+
+        wb.save(excel_path)
+        os.remove(temp_img_path)
+
+    except Exception as e:
+        print(f"Error saving to Excel: {e}")
+
+# Cleanup before starting
+delete_old_faces()
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    current_time = time.time()
+
+    if current_time - last_scan_time >= scan_interval:
+        last_scan_time = current_time
+
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        face_locations = face_recognition.face_locations(rgb_frame)
+        face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+
+        for (top, right, bottom, left), encoding in zip(face_locations, face_encodings):
+            face_image = frame[top:bottom, left:right]
+
+            if master_face_encoding is None or not face_recognition.compare_faces([master_face_encoding], encoding, tolerance=0.6)[0]:
+                master_face_encoding = encoding
+                print("New master face updated.")
+
+                if is_new_face(encoding):
+                    save_unique_face(encoding)
+                    save_face_image(face_image, face_id)
+
+                    blob = cv2.dnn.blobFromImage(face_image, 1.0, (227, 227),
+                                                 (78.426, 87.768, 114.895), swapRB=False)
+
+                    gender_net.setInput(blob)
+                    gender_preds = gender_net.forward()
+                    gender = GENDER_CLASSES[gender_preds[0].argmax()]
+
+                    age_net.setInput(blob)
+                    age_preds = age_net.forward()
+                    age_index = age_preds[0].argmax()
+                    age = AGE_GROUPS[min(age_index, len(AGE_GROUPS) - 1)]
+
+                    ad_image = ad_data.get(gender, {}).get(age, "static/default_ad.jpg")
+
+                    save_to_excel(gender, age, ad_image, face_image)
+
+                    face_id += 1
+                    print(f"Saved: {gender}, {age}, Ad: {ad_image}")
+                else:
+                    print("Duplicate face within the hour. Ignored.")
+            else:
+                print("Same as master face. Skipped.")
+
+            label = f"{gender}, Age: {age}"
+            cv2.rectangle(frame, (left, top), (right, bottom), (255, 255, 255), 2)
+            cv2.putText(frame, label, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, (0, 255, 0), 2)
+
+    cv2.putText(frame, f"Now Showing: {ad_image}", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+    cv2.imshow("Advertisement Display", frame)
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+
+check and do
+------------------------------------------
+
+import cv2
+import numpy as np
+import json
+import time
+import face_recognition
+import sqlite3
+from datetime import datetime, timedelta
+import os
+from face_utils import is_unique_face, save_unique_face_to_db
+
+
+# Load models
+AGE_MODEL = "models/age_net.caffemodel"
+GENDER_MODEL = "models/gender_net.caffemodel"
+AGE_PROTO = "models/deploy_age.prototxt"
+GENDER_PROTO = "models/deploy_gender.prototxt"
+
+age_net = cv2.dnn.readNet(AGE_MODEL, AGE_PROTO)
+gender_net = cv2.dnn.readNet(GENDER_MODEL, GENDER_PROTO)
+
+AGE_GROUPS = ["0-2", "4-6", "8-12", "15-20", "25-32", "38-43", "48-53", "60-100"]
+GENDER_CLASSES = ["Male", "Female"]
+
+
+scan_interval = 10  # seconds
+last_scan_time = time.time() - scan_interval  # So it scans immediately at start
+master_face_encoding = None  # To store the master face
+
+# Load ad data
+with open("adv.json", "r") as file:
+    ad_data = json.load(file)
+
+# Face detector
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+# Create directory for saving faces
+if not os.path.exists("faces"):
+    os.makedirs("faces")
+
+# Open webcam
+cap = cv2.VideoCapture(0)
+
+# Global variables to store the master face encoding and known face encodings
+master_face_encoding = None
+known_faces = []  # Store encodings for comparison
+face_id = 0  # Initialize a counter for saved faces
+
+def is_new_face(encoding):
+    conn = sqlite3.connect("advertisement.db")
+    c = conn.cursor()
+    one_hour_ago = datetime.now() - timedelta(hours=1)
+    c.execute("SELECT encoding FROM unique_faces WHERE timestamp >= ?", (one_hour_ago.strftime("%Y-%m-%d %H:%M:%S"),))
+    rows = c.fetchall()
+    conn.close()
+
+    for row in rows:
+        stored_encoding = np.frombuffer(row[0], dtype=np.float64)
+        matches = face_recognition.compare_faces([stored_encoding], encoding, tolerance=0.6)
+        if True in matches:
+            return False
+    return True
+
+def save_unique_face(encoding):
+    conn = sqlite3.connect("advertisement.db")
+    c = conn.cursor()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("INSERT INTO unique_faces (encoding, timestamp) VALUES (?, ?)", (encoding.tobytes(), now))
+    conn.commit()
+    conn.close()
+
+def save_face_image(face_image, face_id):
+    # Save face image with a unique name based on face_id
+    face_filename = f"faces/face_{face_id}.jpg"
+    cv2.imwrite(face_filename, face_image)
+
+def delete_old_faces():
+    conn = sqlite3.connect("advertisement.db")
+    c = conn.cursor()
+    one_hour_ago = datetime.now() - timedelta(hours=1)
+    c.execute("DELETE FROM unique_faces WHERE timestamp < ?", (one_hour_ago.strftime("%Y-%m-%d %H:%M:%S"),))
+    conn.commit()
+    conn.close()
+
+# Periodically clean up old faces
+delete_old_faces()
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    current_time = time.time()
+
+    if current_time - last_scan_time >= scan_interval:
+        last_scan_time = current_time  # Update scan time
+
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        face_locations = face_recognition.face_locations(rgb_frame)
+        face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+
+        for (top, right, bottom, left), encoding in zip(face_locations, face_encodings):
+            # Compare with master or update master
+            if master_face_encoding is None:
+                master_face_encoding = encoding
+                print("Master face initialized.")
+                if is_new_face(encoding):
+                    save_unique_face(encoding)
+                    face_image = frame[top:bottom, left:right]
+                    save_face_image(face_image, face_id)
+                    face_id += 1
+            else:
+                matches = face_recognition.compare_faces([master_face_encoding], encoding, tolerance=0.6)
+                if not matches[0]:
+                    print("New face detected, updating master.")
+                    master_face_encoding = encoding
+                    if is_new_face(encoding):
+                        save_unique_face(encoding)
+                        face_image = frame[top:bottom, left:right]
+                        save_face_image(face_image, face_id)
+                        face_id += 1
+
+            # Age and gender prediction
+            face = frame[top:bottom, left:right]
+            blob = cv2.dnn.blobFromImage(face, 1.0, (227, 227),
+                                        (78.426, 87.768, 114.895), swapRB=False)
+
+            gender_net.setInput(blob)
+            gender_preds = gender_net.forward()
+            gender = GENDER_CLASSES[gender_preds[0].argmax()]
+
+            age_net.setInput(blob)
+            age_preds = age_net.forward()
+            age_index = age_preds[0].argmax()
+            age = AGE_GROUPS[min(age_index, len(AGE_GROUPS) - 1)]
+
+            ad_image = ad_data.get(gender, {}).get(age, "static/default_ad.jpg")
+
+            label = f"{gender}, Age: {age}"
+            cv2.rectangle(frame, (left, top), (right, bottom), (255, 255, 255), 2)
+            cv2.putText(frame, label, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, (0, 255, 0), 2)
+
+    # Always show the last selected ad
+    cv2.putText(frame, f"Now Showing: {ad_image}", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+    cv2.imshow("Advertisement Display", frame)
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+
+
+
+import openpyxl
+from openpyxl.drawing.image import Image as ExcelImage
+from openpyxl.utils import get_column_letter
+from PIL import Image
+import io
+def save_to_excel(gender, age, ad_image_path, face_image, excel_path="visitor_data.xlsx"):
+    try:
+        # Load or create workbook
+        try:
+            wb = openpyxl.load_workbook(excel_path)
+            ws = wb.active
+        except FileNotFoundError:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            # Create headers
+            ws.append(["Timestamp", "Gender", "Age", "Ad Image", "Face Image"])
+
+            # Set column widths
+            ws.column_dimensions[get_column_letter(1)].width = 20
+            ws.column_dimensions[get_column_letter(2)].width = 10
+            ws.column_dimensions[get_column_letter(3)].width = 10
+            ws.column_dimensions[get_column_letter(4)].width = 30
+            ws.column_dimensions[get_column_letter(5)].width = 15
+
+        # Convert face_image (numpy array) to a PIL Image and save to a bytes buffer
+        face_pil = Image.fromarray(cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB))
+        img_byte_arr = io.BytesIO()
+        face_pil.save(img_byte_arr, format='PNG')
+        img_byte_arr.seek(0)
+
+        # Save image temporarily to disk (required by openpyxl Image)
+        temp_img_path = "temp_face.png"
+        with open(temp_img_path, 'wb') as f:
+            f.write(img_byte_arr.read())
+
+        # Append data row
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ws.append([timestamp, gender, age, ad_image_path, ""])
+
+        # Add the image to the last row
+        img = ExcelImage(temp_img_path)
+        img.width, img.height = 80, 80  # Resize image in Excel
+
+        img_cell = f"E{ws.max_row}"
+        ws.add_image(img, img_cell)
+
+        # Save workbook and delete temp image file
+        wb.save(excel_path)
+        os.remove(temp_img_path)
+
+    except Exception as e:
+        print(f"Error saving to Excel: {e}")
+
+if is_new_face(encoding):
+    save_unique_face(encoding)
+    face_image = frame[top:bottom, left:right]
+    save_face_image(face_image, face_id)
+    face_id += 1
+
+    # Save data to Excel
+    save_to_excel(gender, age, ad_image, face_image)
+import os
+print("Current working directory:", os.getcwd())
+
+cap.release()
+cv2.destroyAllWindows()

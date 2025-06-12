@@ -1,0 +1,2 @@
+to run --- python app.py
+to see db- python view_data.py

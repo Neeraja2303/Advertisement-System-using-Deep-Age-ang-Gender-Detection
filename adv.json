@@ -1,0 +1,22 @@
+{
+    "Male": {
+        "0-2": "static/ads/Male_0-2.jpg",
+        "4-6": "static/ads/Male_4-6.jpg",
+        "8-12": "static/ads/Male_8-12.jpg",
+        "15-20": "static/ads/Male_15-20.jpg",
+        "25-32": "static/ads/Male_25-32.jpg",
+        "38-43": "static/ads/Male_38-43.jpg",
+        "48-53": "static/ads/Male_48-53.jpg",
+        "60-100": "static/ads/Male_60-100.jpg"
+    },
+    "Female": {
+        "0-2": "static/ads/Female_0-2.jpg",
+        "4-6": "static/ads/Female_4-6.jpg",
+        "8-12": "static/ads/Female_8-12.jpg",
+        "15-20": "static/ads/Female_15-20.jpg",
+        "25-32": "static/ads/Female_25-32.jpg",
+        "38-43": "static/ads/Female_38-43.jpg",
+        "48-53": "static/ads/Female_48-53.jpg",
+        "60-100": "static/ads/Female_60-100.jpg"
+    }
+}
